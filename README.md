@@ -1,2 +1,1 @@
-# aws-to-snowflake
-moving data from AWS S3 into Snowflake
+The Snowflake concepts covered are storage integration object, file format object, stage object, streams, CDC using streams, snowpipes and tasks.
