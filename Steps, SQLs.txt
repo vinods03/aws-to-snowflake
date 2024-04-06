@@ -1,0 +1,205 @@
+*************************************** PART 1 ***************************************
+-- use accountadmin role. create storage integration object and grant required access to sysadmin role
+
+use role accountadmin;
+
+-- Create an AWS IAM role with required S3 access on required bucket or full s3 access initially
+-- Use the role ARN below in Snowflake storage integration object
+
+CREATE or REPLACE STORAGE INTEGRATION aws_sf_data
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::100163808729:role/snowflake-access-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://vinod-bucket-for-snowflake');
+
+-- copy the user id and id from below command into trust policy of AWS IAM role created above
+desc INTEGRATION aws_sf_data;
+
+-- only storage integration object needs to be created by accountadmin
+-- the rest of the pipeline objects need to be created by sysadmin
+-- this is the best practice
+-- so grant required access to sysadmin role
+
+grant usage on integration aws_sf_data to role sysadmin;
+
+grant create file format on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant create stage on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant create pipe on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant create table on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant create stream on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant create task on schema "ECOMMERCE_DB"."ECOMMERCE_DEV" to role sysadmin;
+
+grant execute task on account to role sysadmin;
+
+*************************************** PART 2 ***************************************
+-- using sysadmin role, create file format object, stage object, staging table, stream on staging table, final table
+-- also create snowpipe that automatically brings data from AWS S3 into snowsflake staging table
+-- further create task to laod final table using stream on staging table
+
+use role sysadmin;
+
+use schema "ECOMMERCE_DB"."ECOMMERCE_DEV";
+
+CREATE OR REPLACE FILE FORMAT json_load_format TYPE = 'JSON';
+
+create or replace stage stg_lineitem_json_dev
+storage_integration = aws_sf_data
+file_format = json_load_format
+url = 's3://vinod-bucket-for-snowflake/project_1/'
+
+list @stg_lineitem_json_dev;
+
+create or replace table lineitem_raw_json (src variant );
+
+CREATE OR REPLACE STREAM lineitem_std_stream ON TABLE lineitem_raw_json;
+
+create or replace TABLE ECOMMERCE_DB.ECOMMERCE_DEV.LINEITEM cluster by (L_SHIPDATE)(
+	L_ORDERKEY NUMBER(38,0),
+	L_PARTKEY NUMBER(38,0),
+	L_SUPPKEY NUMBER(38,0),
+	L_LINENUMBER NUMBER(38,0),
+	L_QUANTITY NUMBER(12,2),
+	L_EXTENDEDPRICE NUMBER(12,2),
+	L_DISCOUNT NUMBER(12,2),
+	L_TAX NUMBER(12,2),
+	L_RETURNFLAG VARCHAR(1),
+	L_LINESTATUS VARCHAR(1),
+	L_SHIPDATE DATE,
+	L_COMMITDATE DATE,
+	L_RECEIPTDATE DATE,
+	L_SHIPINSTRUCT VARCHAR(25),
+	L_SHIPMODE VARCHAR(10),
+	L_COMMENT VARCHAR(44)
+);
+
+-- snowpipe to auto ingest AWS S3 data into snowflake staging table
+create or replace pipe lineitem_pipe auto_ingest=true as
+copy into lineitem_raw_json from @stg_lineitem_json_dev ON_ERROR = continue;
+
+show pipes
+
+-- arn:aws:sqs:us-east-1:339713112715:sf-snowpipe-AIDAU6GD2XKFXK4V6HBIE-IbYP6YWoeFy3NDNmykcAxA
+-- Copy this ARN into the bucket -> event notification -> SQS queue
+-- ensure the bucket event notification is on the correct prefix for all object create events
+
+-- task that upserts snowflake staging data into snowflake final table using the stream created on staging table
+-- note that task will be executed every minute only when the stream created on staging table has data
+create or replace task lineitem_load_tsk 
+warehouse = compute_wh
+schedule = '1 minute'
+when system$stream_has_data('lineitem_std_stream')
+as 
+merge into lineitem as li 
+using 
+(
+   select 
+        SRC:L_ORDERKEY as L_ORDERKEY,
+        SRC:L_PARTKEY as L_PARTKEY,
+        SRC:L_SUPPKEY as L_SUPPKEY,
+        SRC:L_LINENUMBER as L_LINENUMBER,
+        SRC:L_QUANTITY as L_QUANTITY,
+        SRC:L_EXTENDEDPRICE as L_EXTENDEDPRICE,
+        SRC:L_DISCOUNT as L_DISCOUNT,
+        SRC:L_TAX as L_TAX,
+        SRC:L_RETURNFLAG as L_RETURNFLAG,
+        SRC:L_LINESTATUS as L_LINESTATUS,
+        SRC:L_SHIPDATE as L_SHIPDATE,
+        SRC:L_COMMITDATE as L_COMMITDATE,
+        SRC:L_RECEIPTDATE as L_RECEIPTDATE,
+        SRC:L_SHIPINSTRUCT as L_SHIPINSTRUCT,
+        SRC:L_SHIPMODE as L_SHIPMODE,
+        SRC:L_COMMENT as L_COMMENT
+    from 
+        lineitem_std_stream
+    where metadata$action='INSERT'
+) as li_stg
+on li.L_ORDERKEY = li_stg.L_ORDERKEY and li.L_PARTKEY = li_stg.L_PARTKEY and li.L_SUPPKEY = li_stg.L_SUPPKEY
+when matched then update 
+set 
+    li.L_PARTKEY = li_stg.L_PARTKEY,
+    li.L_SUPPKEY = li_stg.L_SUPPKEY,
+    li.L_LINENUMBER = li_stg.L_LINENUMBER,
+    li.L_QUANTITY = li_stg.L_QUANTITY,
+    li.L_EXTENDEDPRICE = li_stg.L_EXTENDEDPRICE,
+    li.L_DISCOUNT = li_stg.L_DISCOUNT,
+    li.L_TAX = li_stg.L_TAX,
+    li.L_RETURNFLAG = li_stg.L_RETURNFLAG,
+    li.L_LINESTATUS = li_stg.L_LINESTATUS,
+    li.L_SHIPDATE = li_stg.L_SHIPDATE,
+    li.L_COMMITDATE = li_stg.L_COMMITDATE,
+    li.L_RECEIPTDATE = li_stg.L_RECEIPTDATE,
+    li.L_SHIPINSTRUCT = li_stg.L_SHIPINSTRUCT,
+    li.L_SHIPMODE = li_stg.L_SHIPMODE,
+    li.L_COMMENT = li_stg.L_COMMENT
+when not matched then insert 
+(
+    L_ORDERKEY,
+    L_PARTKEY,
+    L_SUPPKEY,
+    L_LINENUMBER,
+    L_QUANTITY,
+    L_EXTENDEDPRICE,
+    L_DISCOUNT,
+    L_TAX,
+    L_RETURNFLAG,
+    L_LINESTATUS,
+    L_SHIPDATE,
+    L_COMMITDATE,
+    L_RECEIPTDATE,
+    L_SHIPINSTRUCT,
+    L_SHIPMODE,
+    L_COMMENT
+) 
+values 
+(
+    li_stg.L_ORDERKEY,
+    li_stg.L_PARTKEY,
+    li_stg.L_SUPPKEY,
+    li_stg.L_LINENUMBER,
+    li_stg.L_QUANTITY,
+    li_stg.L_EXTENDEDPRICE,
+    li_stg.L_DISCOUNT,
+    li_stg.L_TAX,
+    li_stg.L_RETURNFLAG,
+    li_stg.L_LINESTATUS,
+    li_stg.L_SHIPDATE,
+    li_stg.L_COMMITDATE,
+    li_stg.L_RECEIPTDATE,
+    li_stg.L_SHIPINSTRUCT,
+    li_stg.L_SHIPMODE,
+    li_stg.L_COMMENT
+);
+
+show tasks;
+
+alter task lineitem_load_tsk resume;
+
+
+*************************************** PART 3 ***************************************
+-- Verification. 
+-- Upload a json file in s3://vinod-bucket-for-snowflake/project_1/. 
+
+-- Check if data is available in snowflake staging table
+select * from lineitem_raw_json
+
+-- Check if data is available in stream before task has run and consumed the satging data into final table
+select * from lineitem_std_stream
+
+-- Check if final table in snowflake is loaded
+select * from lineitem
+
+-- Check if any issue in task execution
+
+select *
+  from table(information_schema.task_history(
+    scheduled_time_range_start=>dateadd('hour',-1,current_timestamp()),
+    result_limit => 100));
+
+-- Suspend the task to be on safer side
+alter task lineitem_load_tsk suspend;
